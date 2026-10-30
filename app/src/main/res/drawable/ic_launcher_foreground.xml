@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Walkie-talkie glyph: body, antenna, speaker grille. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#FF101418" android:pathData="M58,26h4v12h-4z" />
+    <path android:fillColor="#FF101418" android:pathData="M42,38h24a4,4 0,0 1,4 4v36a4,4 0,0 1,-4 4h-24a4,4 0,0 1,-4 -4v-36a4,4 0,0 1,4 -4z" />
+    <path android:fillColor="#FFF2A900" android:pathData="M45,46h18v3h-18zM45,52h18v3h-18zM45,58h18v3h-18z" />
+    <path android:fillColor="#FFF2A900" android:pathData="M54,71m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
+</vector>
