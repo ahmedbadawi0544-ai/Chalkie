@@ -89,6 +89,14 @@ class FloorControl(private val myId: UInt, private val clock: Clock, private val
     @Synchronized
     fun isBusy(channel: Int): Boolean = active(channel, clock.nowMs()).isNotEmpty()
 
+    /** True while I talk or anyone is heard talking, on any channel or private call. */
+    @Synchronized
+    fun anyActive(): Boolean {
+        if (myTalk != null) return true
+        val now = clock.nowMs()
+        return remotes.keys.toList().any { active(it, now).isNotEmpty() }
+    }
+
     /** True when my talk passed MAX_TALK_MS and must be auto-released. */
     @Synchronized
     fun talkExpired(): Boolean = myTalk?.let { clock.nowMs() - it.startMs >= ChalkieConfig.MAX_TALK_MS } ?: false

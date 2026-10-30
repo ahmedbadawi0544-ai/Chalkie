@@ -27,7 +27,9 @@ import com.chalkie.app.core.SystemClock
 import com.chalkie.app.crypto.GroupKeys
 import com.chalkie.app.crypto.LinkHandshake
 import com.chalkie.app.transport.LinkInfo
+import com.chalkie.app.transport.LinkPreparer
 import com.chalkie.app.transport.LinkSendQueue
+import com.chalkie.app.transport.TalkAware
 import com.chalkie.app.transport.Transport
 import com.chalkie.app.transport.TransportEvent
 import com.chalkie.app.transport.TransportType
@@ -64,7 +66,7 @@ class BleTransport(
     private val myId: UInt,
     private val keys: GroupKeys,
     private val clock: Clock = SystemClock,
-) : Transport {
+) : Transport, TalkAware, LinkPreparer {
     override val type = TransportType.BLE
 
     private val _events = MutableSharedFlow<TransportEvent>(extraBufferCapacity = 1024)
@@ -87,6 +89,10 @@ class BleTransport(
     private val links = ConcurrentHashMap<UInt, Link>()
     private val connecting = ConcurrentHashMap.newKeySet<UInt>()
     private val blacklist = ConcurrentHashMap<String, Long>()   // address -> until
+    /** Make-before-break: neighbors to link with first, until the given time (SPEC §19.2). */
+    private val preferred = ConcurrentHashMap<UInt, Long>()
+    /** Low-power scanning while a talk is active (SPEC §19.5). */
+    @Volatile private var lowPowerScan = false
 
     /** Live state for the UI. */
     @Volatile var state: String = "off"
@@ -168,6 +174,31 @@ class BleTransport(
 
     override fun links(): List<LinkInfo> = links.values.map { it.info() }
 
+    override fun setTalkActive(active: Boolean) {
+        if (active == lowPowerScan) return
+        lowPowerScan = active
+        synchronized(this) {
+            if (!running) return
+            runCatching { adapter.bluetoothLeScanner?.stopScan(scanCallback) }
+            startScanning()
+        }
+        Log.i(TAG, "scan mode: ${if (active) "low power (talk)" else "low latency"}")
+    }
+
+    override fun prepareLink(neighborId: UInt) {
+        if (links.containsKey(neighborId)) return
+        preferred[neighborId] = clock.nowMs() + ChalkieConfig.BLE_PREPARE_HOLD_MS
+        Log.i(TAG, "make-before-break: preparing a link to ${Ids.hex(neighborId)}")
+        maybeConnect()
+    }
+
+    private fun isPreferred(id: UInt, now: Long): Boolean {
+        val until = preferred[id] ?: return false
+        if (now < until) return true
+        preferred.remove(id)
+        return false
+    }
+
     // ---- advertising / scanning ----
 
     private val advCallback = object : AdvertiseCallback() {
@@ -213,7 +244,7 @@ class BleTransport(
             .setManufacturerData(ChalkieConfig.BLE_COMPANY_ID, prefix, mask)
             .build()
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(if (lowPowerScan) ScanSettings.SCAN_MODE_LOW_POWER else ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
         scanner.startScan(listOf(filter), settings, scanCallback)
@@ -246,13 +277,17 @@ class BleTransport(
     private fun maybeConnect() {
         if (!running) return
         val now = clock.nowMs()
-        val sorted = candidates.entries.sortedByDescending { it.value.rssi }
+        // Backup links for degrading ones first, then strongest first.
+        val sorted = candidates.entries.sortedWith(
+            compareByDescending<Map.Entry<UInt, Candidate>> { isPreferred(it.key, now) }.thenByDescending { it.value.rssi },
+        )
         for ((id, c) in sorted) {
             if (myId > id) continue                          // only the lower nodeId initiates
             if (links.containsKey(id) || id in connecting) continue
             if (isBlacklisted(c.device.address, now)) continue
             if (now - c.lastAttemptMs < ChalkieConfig.BLE_CONNECT_RETRY_MS) continue
-            if (links.size + connecting.size < ChalkieConfig.BLE_MAX_LINKS) {
+            val spare = if (isPreferred(id, now)) ChalkieConfig.BLE_SPARE_LINKS else 0
+            if (links.size + connecting.size < ChalkieConfig.BLE_MAX_LINKS + spare) {
                 connect(id, c)
             } else {
                 considerSwap(c, now)
@@ -302,7 +337,8 @@ class BleTransport(
                 break
             }
             val addr = sock.remoteDevice.address
-            if (isBlacklisted(addr, clock.nowMs()) || links.size >= ChalkieConfig.BLE_MAX_LINKS) {
+            // One spare slot: the other side may be making a backup link to me (make-before-break).
+            if (isBlacklisted(addr, clock.nowMs()) || links.size >= ChalkieConfig.BLE_MAX_LINKS + ChalkieConfig.BLE_SPARE_LINKS) {
                 runCatching { sock.close() }
                 continue
             }
@@ -391,6 +427,10 @@ class BleTransport(
             // Liveness: HELLO is the keepalive (SPEC §11.3).
             links.values.filter { now - it.lastRxMs > ChalkieConfig.BLE_LINK_TIMEOUT_MS }.forEach { it.close() }
             candidates.entries.removeIf { now - it.value.lastSeenMs > ChalkieConfig.NODE_TIMEOUT_MS && !links.containsKey(it.key) }
+            // Back to BLE_MAX_LINKS once the spare is no longer needed: drop the weakest non-preferred.
+            if (links.size > ChalkieConfig.BLE_MAX_LINKS) {
+                links.values.filter { !isPreferred(it.peerId, now) }.minByOrNull { rssiOf(it.peerId) ?: Double.MAX_VALUE }?.close()
+            }
             if (tick % 2 == 0) links.values.forEach { _events.tryEmit(TransportEvent.LinkStats(it.info())) }
             maybeConnect()
         }
@@ -402,7 +442,7 @@ class BleTransport(
         @Volatile var lastRxMs = clock.nowMs()
         @Volatile var closed = false
 
-        fun info() = LinkInfo(peerId, TransportType.BLE, rssiOf(peerId)?.toInt(), 0f, null, lastRxMs)
+        fun info() = LinkInfo(peerId, TransportType.BLE, rssiOf(peerId)?.toInt(), queue.lossRate(clock.nowMs()), null, lastRxMs)
 
         fun enqueue(bytes: ByteArray, priority: Priority): Boolean {
             if (closed) return false

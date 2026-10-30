@@ -55,3 +55,14 @@ interface BroadcastCapable {
     /** Returns false if it could not broadcast; the router then sends per link. */
     fun sendAll(bytes: ByteArray, priority: Priority): Boolean
 }
+
+/** A transport that can bring up a backup link to a neighbor on request (make-before-break, SPEC §19.2). */
+interface LinkPreparer {
+    /** Another link to [neighborId] is degrading: connect to it here if possible, ahead of other candidates. */
+    fun prepareLink(neighborId: UInt)
+}
+
+/** A transport that changes its radio duty while a talk is active (SPEC §19.5). */
+interface TalkAware {
+    fun setTalkActive(active: Boolean)
+}

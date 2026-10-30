@@ -127,7 +127,8 @@ class LanSimTest {
         assertEquals(StarRole.Off, net.node(1u).election.role, "charging, but on LAN")
         assertEquals(StarRole.Off, net.node(2u).election.role)
         assertIs<StarRole.Hub>(net.node(3u).election.role)
-        assertEquals(StarRole.Leaf(3u, (net.node(3u).election.role as StarRole.Hub).epoch), net.node(4u).election.role)
+        val leaf = assertIs<StarRole.Leaf>(net.node(4u).election.role)
+        assertEquals(3u to (net.node(3u).election.role as StarRole.Hub).epoch, leaf.hubId to leaf.epoch)
 
         // Everyone hears everyone across LAN, bridge, star.
         talk(net.node(2u), 10)

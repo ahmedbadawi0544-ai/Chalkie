@@ -15,10 +15,34 @@ class LinkSendQueue(private val maxPerPriority: Int = 256) {
     var droppedStaleVoice = 0L
         private set
 
+    // Sender-side loss estimate: packets refused (queue full) or dropped stale, per stats window.
+    private var windowStartMs = Long.MIN_VALUE
+    private var offered = 0
+    private var lost = 0
+    private var lastRate = 0f
+
+    /** Fraction of packets lost on this link in the last full LINK_STATS_WINDOW_MS (0..1). */
+    @Synchronized
+    fun lossRate(nowMs: Long): Float {
+        roll(nowMs)
+        return lastRate
+    }
+
+    private fun roll(nowMs: Long) {
+        if (windowStartMs == Long.MIN_VALUE) windowStartMs = nowMs
+        if (nowMs - windowStartMs < ChalkieConfig.LINK_STATS_WINDOW_MS) return
+        lastRate = if (offered == 0) 0f else lost.toFloat() / offered
+        offered = 0
+        lost = 0
+        windowStartMs = nowMs
+    }
+
     @Synchronized
     fun offer(bytes: ByteArray, priority: Priority, nowMs: Long): Boolean {
         val q = queues.getValue(priority)
-        if (q.size >= maxPerPriority) return false
+        roll(nowMs)
+        offered++
+        if (q.size >= maxPerPriority) { lost++; return false }
         q.addLast(Item(bytes, nowMs))
         return true
     }
@@ -31,6 +55,7 @@ class LinkSendQueue(private val maxPerPriority: Int = 256) {
                 val item = q.removeFirst()
                 if (p == Priority.VOICE && nowMs - item.enqueuedMs > ChalkieConfig.VOICE_MAX_QUEUE_MS) {
                     droppedStaleVoice++
+                    lost++
                     continue
                 }
                 return item.bytes

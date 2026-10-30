@@ -24,6 +24,8 @@ class Playout(
     fun onVoice(srcId: UInt, payload: VoicePayload) {
         val s = streams.getOrPut(Key(srcId, payload.streamId)) { Stream(decoders.create(payload.codec)) }
         if (s.decoder == null) { undecodable += payload.frames.size; return }
+        // Redundant copies first: the buffer ignores frames it already has or that are too late.
+        payload.redundant.forEachIndexed { i, f -> s.jb.push((payload.redundantSeq + i) and 0xFFFF, f) }
         payload.frames.forEachIndexed { i, f -> s.jb.push((payload.frameSeq + i) and 0xFFFF, f) }
     }
 

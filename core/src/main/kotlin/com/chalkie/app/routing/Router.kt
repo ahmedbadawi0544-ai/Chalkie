@@ -70,6 +70,13 @@ class Router(
 
     var unicast: UnicastRoute? = null
 
+    /**
+     * Make-before-break (SPEC §19.2): true while the link to a neighbor over a transport is
+     * degrading. Such a link no longer "covers" its neighbor, so the next transport carries a
+     * duplicate (dedup keeps one) until the link recovers or drops.
+     */
+    var degrading: (UInt, TransportType) -> Boolean = { _, _ -> false }
+
     fun interface Listener {
         fun onDeliver(packet: DecodedPacket, arrivedVia: TransportType, from: UInt)
     }
@@ -107,13 +114,14 @@ class Router(
             dedup.add(myId, msgId)
             stats.originated.incrementAndGet()
         }
-        if (dstId != Ids.BROADCAST && sendUnicast(bytes, dstId, type.priority, from = null)) return msgId
+        if (dstId != Ids.BROADCAST && sendUnicast(bytes, dstId, type, from = null)) return msgId
         // Cheapest transport first: LAN, WD into the star, then BLE to whoever they miss.
         val sent = HashSet<UInt>()
         val lanReached = sendLan(bytes, type.priority, arrivedVia = null, from = null, srcId = myId, sent = sent)
         val starReached = sendIntoStar(bytes, type.priority, arrivedVia = null, from = null, srcId = myId, sent = sent)
         // My HELLO goes over every transport (SPEC §7): it is also each BLE link's keepalive.
-        val covered = if (type == PacketType.HELLO) NOT_COVERED else coverage(lanReached, starReached, sent)
+        // Critical packets go on a 2nd transport too (SPEC §19.3).
+        val covered = if (type == PacketType.HELLO || type.critical) NOT_COVERED else coverage(lanReached, starReached, sent)
         sendBle(bytes, type.priority, from = null, srcId = myId, covered = covered)
         return msgId
     }
@@ -147,34 +155,44 @@ class Router(
 
     private fun forward(bytes: ByteArray, h: PacketHeader, via: TransportType, from: UInt) {
         val relay = PacketCodec.forRelay(bytes)
-        if (!h.isBroadcast && sendUnicast(relay, h.dstId, h.priority, from)) {
+        if (!h.isBroadcast && sendUnicast(relay, h.dstId, h.type, from)) {
             stats.relayed.incrementAndGet()
             return
         }
         val sent = HashSet<UInt>()
         val lanReached = sendLan(relay, h.priority, via, from, h.srcId, sent)
         val starReached = sendIntoStar(relay, h.priority, via, from, h.srcId, sent)
-        sendBle(relay, h.priority, from, h.srcId, coverage(lanReached, starReached, sent))
+        sendBle(relay, h.priority, from, h.srcId, if (h.type.critical) NOT_COVERED else coverage(lanReached, starReached, sent))
     }
 
     /**
      * Sends along the shortest path. False (caller floods; only dst delivers) when there is no
      * route, the hop would bounce the packet back where it came from, or the send fails.
+     * Critical packets, and VOICE while the chosen link is degrading, also go to the same hop
+     * over one more transport (SPEC §19.3).
      */
-    private fun sendUnicast(bytes: ByteArray, dstId: UInt, priority: Priority, from: UInt?): Boolean {
+    private fun sendUnicast(bytes: ByteArray, dstId: UInt, packetType: PacketType, from: UInt?): Boolean {
         val (hop, type) = unicast?.nextHop(dstId) ?: return false
         if (hop == from) return false
-        val t = synchronized(this) { transports[type] } ?: return false
-        if (!t.send(hop, bytes, priority)) return false
+        val (t, others) = synchronized(this) { transports[type] to transports.values.filter { it.type != type } }
+        if (t == null || !t.send(hop, bytes, packetType.priority)) return false
         stats.sent(type)
+        if (packetType.critical || (packetType == PacketType.VOICE && degrading(hop, type))) {
+            others.firstOrNull { o -> o.links().any { it.neighborId == hop } && o.send(hop, bytes, packetType.priority) }
+                ?.let { stats.sent(it.type) }
+        }
         return true
     }
 
-    /** m is covered when LAN or the star already carries the packet to it, or I just sent it there. */
+    /**
+     * m is covered when LAN or the star already carries the packet to it, or I just sent it there,
+     * over a link that is not degrading.
+     */
     private fun coverage(lanReached: Boolean, starReached: Boolean, sent: Set<UInt>): (UInt) -> Boolean {
-        val lanPeers = if (lanReached) lanPeers() else emptySet()
+        val lanPeers = if (lanReached) lanPeers().filterTo(HashSet()) { !degrading(it, TransportType.LAN) } else emptySet()
         val view = star
-        return { m -> m in sent || m in lanPeers || (starReached && view.covers(m)) }
+        val hub = view.role is StarRole.Hub
+        return { m -> m in sent || m in lanPeers || (starReached && view.covers(m) && !(hub && degrading(m, TransportType.WD))) }
     }
 
     private fun lanPeers(): Set<UInt> =
@@ -201,7 +219,7 @@ class Router(
                 } else {
                     peers.filter { it != from && it != srcId }.forEach { if (lan.send(it, bytes, priority)) stats.sent(TransportType.LAN) }
                 }
-                sent += peers
+                peers.filterTo(sent) { !degrading(it, TransportType.LAN) }
                 if (arrivedVia != null) stats.relayed.incrementAndGet()
                 true
             }
@@ -210,7 +228,8 @@ class Router(
     }
 
     /**
-     * WD STAR rules. Returns true when the packet has reached (or is now reaching) the whole star.
+     * WD STAR rules. Returns true when the packet has reached (or is now reaching) the whole star
+     * over links that are not degrading.
      * - Hub: forwards to every leaf except the one it came from.
      * - Leaf: sends only to the hub, and never relays a packet that arrived via WD
      *   (the hub already gave it to the whole star) or that a star member originated.
@@ -225,13 +244,19 @@ class Router(
             is StarRole.Hub -> wd?.links()?.forEach { l ->
                 val m = l.neighborId
                 if (m == from || m == srcId) return@forEach
-                if (wd.send(m, bytes, priority)) { sent += m; reached = true; stats.sent(TransportType.WD); countRelay(arrivedVia) }
+                if (wd.send(m, bytes, priority)) {
+                    if (!degrading(m, TransportType.WD)) sent += m
+                    reached = true; stats.sent(TransportType.WD); countRelay(arrivedVia)
+                }
             }
             is StarRole.Leaf -> when {
                 reached -> Unit                                   // leaves never relay back into WD
                 srcId != myId && view.covers(srcId) -> reached = true   // originator already sent it into the star
                 wd != null && wd.send(role.hubId, bytes, priority) -> {
-                    sent += role.hubId; reached = true; stats.sent(TransportType.WD); countRelay(arrivedVia)
+                    // Over a degrading link to the hub the star may miss it: BLE backs it up.
+                    reached = !degrading(role.hubId, TransportType.WD)
+                    if (reached) sent += role.hubId
+                    stats.sent(TransportType.WD); countRelay(arrivedVia)
                 }
             }
             StarRole.Off -> Unit

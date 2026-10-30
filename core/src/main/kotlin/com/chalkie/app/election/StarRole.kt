@@ -6,10 +6,14 @@ import java.nio.ByteBuffer
 sealed interface StarRole {
     /** No hub needed (or none claimed yet): Wi-Fi Direct stays off. */
     data object Off : StarRole
-    /** I am the hub: advertise and accept leaves. */
-    data class Hub(val epoch: Int) : StarRole
-    /** I am a leaf: connect only to this hub at this epoch. */
-    data class Leaf(val hubId: UInt, val epoch: Int) : StarRole
+    /** I am the hub: advertise and accept leaves. [standbyId] takes over if I disappear. */
+    data class Hub(val epoch: Int, val standbyId: UInt? = null) : StarRole
+    /**
+     * I am a leaf: connect only to this hub at this epoch. While [standbyId] is set, keep
+     * discovering so the standby's advert is found the moment it starts (SPEC §19.1).
+     * When [standbyId] is my own id, I am the standby.
+     */
+    data class Leaf(val hubId: UInt, val epoch: Int, val standbyId: UInt? = null) : StarRole
 }
 
 /** Implemented by transports that follow the STAR role (Wi-Fi Direct). */

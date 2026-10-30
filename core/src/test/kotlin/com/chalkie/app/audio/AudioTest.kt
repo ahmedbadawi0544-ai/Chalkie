@@ -46,12 +46,13 @@ class AudioTest {
     }
 
     @Test
-    fun jitterBufferRepeatsOnceThenSilenceAndDropsLate() {
+    fun jitterBufferConcealsOnePacketThenSilenceAndDropsLate() {
         val jb = JitterBuffer()
         (0..3).forEach { jb.push(it, f(it)) }
         repeat(4) { jb.pull() }
         val repeated = jb.pull()
-        assertEquals(3, repeated!![0].toInt(), "missing frame repeats last once")
+        assertEquals(3, repeated!![0].toInt(), "missing frame repeats last")
+        assertEquals(3, jb.pull()!![0].toInt(), "for a whole packet (2 frames)")
         assertNull(jb.pull(), "then silence")
         jb.push(4, f(4))
         assertEquals(1, jb.lateDropped)

@@ -16,6 +16,8 @@ enum class PacketType(val code: Int, val defaultTtl: Int, val priority: Priority
     TALK_START(0x10, ChalkieConfig.TTL_CONTROL, Priority.CONTROL),
     VOICE(0x11, ChalkieConfig.TTL_VOICE, Priority.VOICE),
     TALK_END(0x12, ChalkieConfig.TTL_CONTROL, Priority.CONTROL),
+    /** Private-call callee → caller: streamId(2). Tells the caller the call got through. */
+    TALK_ACK(0x13, ChalkieConfig.TTL_CONTROL, Priority.CONTROL),
     TEXT(0x20, ChalkieConfig.TTL_TEXT, Priority.NORMAL),
     /** Store & forward voice message chunk (P5): uid(8) ‖ index(2) ‖ count(2) ‖ data. */
     VMSG(0x21, ChalkieConfig.TTL_TEXT, Priority.NORMAL),
@@ -24,6 +26,9 @@ enum class PacketType(val code: Int, val defaultTtl: Int, val priority: Priority
     SOS(0x30, ChalkieConfig.TTL_SOS, Priority.SOS),
     SOS_ACK(0x31, ChalkieConfig.TTL_SOS, Priority.SOS),
     LAN_PROBE(0x40, ChalkieConfig.TTL_LAN_PROBE, Priority.CONTROL);
+
+    /** Critical packets always go out on 2 transports when available (SPEC §19.3); dedup keeps one. */
+    val critical: Boolean get() = this == SOS || this == SOS_ACK || this == TALK_START || this == TALK_END || this == TALK_ACK
 
     companion object {
         private val byCode = entries.associateBy { it.code }

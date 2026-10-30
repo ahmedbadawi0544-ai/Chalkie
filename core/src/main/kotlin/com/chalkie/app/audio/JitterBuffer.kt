@@ -4,7 +4,8 @@ import com.chalkie.app.core.ChalkieConfig
 
 /**
  * One stream's frame reorder/playout buffer (SPEC §12). Pulled once per frame tick.
- * Late frames are dropped; a missing frame repeats the last one once, then silence.
+ * Late frames are dropped; missing frames repeat the last one (up to JITTER_CONCEAL_FRAMES, one
+ * packet's worth), then silence.
  */
 class JitterBuffer(
     private val frameMs: Int = ChalkieConfig.VOICE_FRAME_MS,
@@ -71,7 +72,7 @@ class JitterBuffer(
             return f
         }
         missRun++
-        return if (missRun == 1) last else null
+        return if (missRun <= ChalkieConfig.JITTER_CONCEAL_FRAMES) last else null
     }
 
     private fun unwrap(seq16: Int): Long {

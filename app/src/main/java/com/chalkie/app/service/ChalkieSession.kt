@@ -297,6 +297,7 @@ class ChalkieSession(
                 log("VOICE_MSG", name(m.from), durationMs = m.durationMs, text = "received")
                 "Voice message from ${name(m.from)}"
             }
+            is NodeEvent.TalkAcked -> "${name(e.srcId)} is hearing you"
             is NodeEvent.VoiceMessageDelivered -> {
                 scope.launch { db.voiceMessages().markDelivered(e.uid) }
                 log("VOICE_MSG", identity.name, text = "delivered to ${name(e.to)}")

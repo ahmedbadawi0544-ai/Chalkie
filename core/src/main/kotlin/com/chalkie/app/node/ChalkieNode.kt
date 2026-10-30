@@ -20,6 +20,7 @@ import com.chalkie.app.election.StarRole
 import com.chalkie.app.message.VoiceMailbox
 import com.chalkie.app.message.VoiceMessage
 import com.chalkie.app.routing.LinkCost
+import com.chalkie.app.routing.LinkHealth
 import com.chalkie.app.routing.TopologyGraph
 import com.chalkie.app.routing.HelloPayload
 import com.chalkie.app.routing.Role
@@ -27,6 +28,8 @@ import com.chalkie.app.routing.NeighborSnapshot
 import com.chalkie.app.routing.NeighborTable
 import com.chalkie.app.routing.Router
 import com.chalkie.app.transport.LanStatus
+import com.chalkie.app.transport.LinkPreparer
+import com.chalkie.app.transport.TalkAware
 import com.chalkie.app.transport.Transport
 import com.chalkie.app.transport.TransportEvent
 import com.chalkie.app.transport.TransportType
@@ -54,6 +57,8 @@ sealed interface NodeEvent {
         val srcId: UInt, val channel: Int, val streamId: Int, val priority: TalkPriority, val private: Boolean = false,
     ) : NodeEvent
     data class TalkEnded(val srcId: UInt, val channel: Int, val streamId: Int, val private: Boolean = false) : NodeEvent
+    /** The callee of my private call heard its TALK_START. */
+    data class TalkAcked(val srcId: UInt, val streamId: Int) : NodeEvent
     data class TextIn(val srcId: UInt, val channel: Int, val text: String, val private: Boolean) : NodeEvent
     data class VoiceMessageIn(val message: VoiceMessage) : NodeEvent
     data class VoiceMessageDelivered(val uid: Long, val to: UInt) : NodeEvent
@@ -84,6 +89,7 @@ class ChalkieNode(
     val floor = FloorControl(nodeId, clock, random)
     val election = ElectionManager(nodeId, clock, neighbors)
     val bridges = BridgeElection(nodeId, clock, neighbors)
+    val health = LinkHealth(clock)
 
     private val _role = MutableStateFlow<StarRole>(StarRole.Off)
     val role: StateFlow<StarRole> = _role.asStateFlow()
@@ -126,9 +132,17 @@ class ChalkieNode(
     private val jobs = mutableListOf<Job>()
     private var talkTimer: Job? = null
     private var frameSeq = 0
+    /** Frames of my previous VOICE packet, repeated in the next one (SPEC §19.4). */
+    private var lastFrames: List<ByteArray> = emptyList()
+    private var lastCodec: Codec? = null
+
+    private val _talkActive = MutableStateFlow(false)
+    /** True while I talk or hear anyone talking (SPEC §19.5). */
+    val talkActive: StateFlow<Boolean> = _talkActive.asStateFlow()
 
     init {
         router.listener = Router.Listener { p, via, from -> onDeliver(p, via, from) }
+        router.degrading = health::isDegrading
     }
 
     /** Star membership as seen from here, over live WD links only. */
@@ -155,7 +169,10 @@ class ChalkieNode(
         router.star = starView
         router.unicast = Router.UnicastRoute { dst ->
             val hop = TopologyGraph.nextHop(nodeId, dst, topology()) ?: return@UnicastRoute null
-            val link = neighbors.get(hop)?.links?.values?.let(LinkCost::best) ?: return@UnicastRoute null
+            val links = neighbors.get(hop)?.links?.values ?: return@UnicastRoute null
+            // Make-before-break: prefer a healthy link over a degrading one, even if it costs more.
+            val link = LinkCost.best(links.filter { !health.isDegrading(hop, it.type) }) ?: LinkCost.best(links)
+                ?: return@UnicastRoute null
             hop to link.type
         }
     }
@@ -208,6 +225,7 @@ class ChalkieNode(
             FloorControl.Request.Busy -> false
             is FloorControl.Request.Granted -> {
                 frameSeq = 0
+                lastFrames = emptyList()
                 talkTarget = target
                 router.originate(PacketType.TALK_START, channel, TalkPayload.start(r.streamId, priority), dst(), timestamp = ts)
                 talkTimer?.cancel()
@@ -215,6 +233,7 @@ class ChalkieNode(
                     delay(ChalkieConfig.MAX_TALK_MS)
                     if (floor.talkExpired()) stopMyTalk(StopReason.MAX_TALK_TIME)
                 }
+                updateTalkActive()
                 true
             }
         }
@@ -254,8 +273,11 @@ class ChalkieNode(
     /** Sends one VOICE packet with [frames] (FRAMES_PER_PACKET encoded frames). False if not talking. */
     fun sendVoice(frames: List<ByteArray>, codec: Codec = Codec.G711_ULAW): Boolean {
         val talk = floor.myTalk ?: return false
-        val payload = VoicePayload(talk.claim.streamId, frameSeq and 0xFFFF, codec, frames)
+        val redundant = if (ChalkieConfig.VOICE_REDUNDANT_PACKETS > 0 && codec == lastCodec) lastFrames else emptyList()
+        val payload = VoicePayload(talk.claim.streamId, frameSeq and 0xFFFF, codec, frames, redundant)
         frameSeq += frames.size
+        lastFrames = frames
+        lastCodec = codec
         router.originate(PacketType.VOICE, wireChannel(talk), payload.encode(), dst())
         return true
     }
@@ -303,13 +325,15 @@ class ChalkieNode(
         while (scope.isActive) {
             sendHello()
             val jitter = random.nextLong(-ChalkieConfig.HELLO_JITTER_MS, ChalkieConfig.HELLO_JITTER_MS + 1)
-            delay(ChalkieConfig.HELLO_INTERVAL_MS + jitter)
+            val interval = if (_talkActive.value) ChalkieConfig.HELLO_INTERVAL_TALK_MS else ChalkieConfig.HELLO_INTERVAL_MS
+            delay(interval + jitter)
         }
     }
 
     private suspend fun electionLoop() {
         while (scope.isActive) {
             delay(ChalkieConfig.ELECTION_TICK_MS)
+            updateTalkActive()
             // Joining or leaving the LAN changes who takes part in elections: tell everyone now.
             val onLan = lan?.lanActive == true
             if (onLan != election.onLan) {
@@ -331,14 +355,41 @@ class ChalkieNode(
         }
     }
 
-    /** Pushes a changed role to the STAR transports and tells everyone at once. */
+    /**
+     * Pushes a changed role to the STAR transports and tells everyone at once. A new standby
+     * only goes to the transports (they pre-discover it); it isn't news for the team.
+     */
     private fun applyRole() {
         val r = election.role
-        if (r == _role.value) return
+        val old = _role.value
+        if (r == old) return
         _role.value = r
         transports.filterIsInstance<StarControl>().forEach { it.setStarRole(r) }
+        if (withoutStandby(r) == withoutStandby(old)) return
         _events.tryEmit(NodeEvent.RoleChanged(r))
         sendHello()
+    }
+
+    private fun withoutStandby(r: StarRole): StarRole = when (r) {
+        is StarRole.Hub -> r.copy(standbyId = null)
+        is StarRole.Leaf -> r.copy(standbyId = null)
+        StarRole.Off -> r
+    }
+
+    /** Talk on/off: sparser HELLOs, longer loss windows, low-power BLE scanning (SPEC §19.5). */
+    private fun updateTalkActive() {
+        val active = floor.anyActive()
+        if (active == _talkActive.value) return
+        _talkActive.value = active
+        election.talkActive = active
+        bridges.talkActive = active
+        transports.filterIsInstance<TalkAware>().forEach { it.setTalkActive(active) }
+    }
+
+    /** A link to [neighborId] is degrading: bring up a backup on every other transport that can. */
+    private fun prepareBackup(neighborId: UInt, degraded: TransportType) {
+        transports.filter { it.type != degraded && it is LinkPreparer && it.links().none { l -> l.neighborId == neighborId } }
+            .forEach { (it as LinkPreparer).prepareLink(neighborId) }
     }
 
     private suspend fun expireLoop() {
@@ -358,9 +409,20 @@ class ChalkieNode(
     private fun onTransportEvent(e: TransportEvent) {
         when (e) {
             is TransportEvent.PacketIn -> router.onPacketIn(e.type, e.neighborId, e.bytes)
-            is TransportEvent.LinkUp -> { neighbors.onLinkUp(e.info); publishPeers(); sendHello() }
-            is TransportEvent.LinkDown -> { neighbors.onLinkDown(e.type, e.neighborId); publishPeers(); sendHello() }
-            is TransportEvent.LinkStats -> neighbors.onLinkStats(e.info)
+            is TransportEvent.LinkUp -> {
+                neighbors.onLinkUp(e.info)
+                if (health.onSample(e.info)) prepareBackup(e.info.neighborId, e.type)
+                publishPeers(); sendHello()
+            }
+            is TransportEvent.LinkDown -> {
+                neighbors.onLinkDown(e.type, e.neighborId)
+                health.onLinkDown(e.type, e.neighborId)
+                publishPeers(); sendHello()
+            }
+            is TransportEvent.LinkStats -> {
+                neighbors.onLinkStats(e.info)
+                if (health.onSample(e.info)) prepareBackup(e.info.neighborId, e.type)
+            }
         }
     }
 
@@ -393,6 +455,13 @@ class ChalkieNode(
                     _events.tryEmit(NodeEvent.MyTalkStopped(reason))
                 }
                 if (hear) _events.tryEmit(NodeEvent.TalkStarted(h.srcId, h.channel, streamId, priority, private))
+                // A private call to me: tell the caller it got through.
+                if (private) router.originate(PacketType.TALK_ACK, 0, TalkPayload.end(streamId), dstId = h.srcId)
+                updateTalkActive()
+            }
+            PacketType.TALK_ACK -> {
+                val streamId = TalkPayload.streamId(p.payload) ?: return
+                if (private && floor.myTalk?.claim?.streamId == streamId) _events.tryEmit(NodeEvent.TalkAcked(h.srcId, streamId))
             }
             PacketType.VOICE -> {
                 val v = VoicePayload.decode(p.payload) ?: return

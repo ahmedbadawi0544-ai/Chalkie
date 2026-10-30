@@ -136,3 +136,29 @@ Legend: [x] done · [~] in progress · [ ] todo
 
 **Core tests: 88/88 passing.**
 
+## Wi-Fi 8–style reliability (SPEC §19)
+
+### `:core`
+- [x] Election: primary + standby hub, fast loss on WD link-down, provisional succession (confirm / revert / timeout)
+- [x] LinkHealth: RSSI slope EMA + loss; degrading links lose coverage, unicast prefers healthy links, backup link requested
+- [x] Critical packets (SOS, SOS_ACK, TALK_START, TALK_END, TALK_ACK) on 2 transports; VOICE duplicated only while degrading
+- [x] TALK_ACK for private calls
+- [x] VOICE redundancy (previous packet's frames, codec bit 7); jitter buffer conceals one whole packet
+- [x] Talk mode: HELLO 5 s, longer loss windows, `TalkAware` transports
+- [x] Send queues report loss (refused + stale drops per window)
+
+### `:app`
+- [x] WdTransport: leaves keep discovering while a standby exists, cached adverts → instant connect to the new hub
+- [x] BleTransport: low-power scan during talks, `prepareLink` (preferred + 1 spare link), loss in LinkStats
+- [x] "X is hearing you" on TALK_ACK
+
+### Tests
+- [x] Hub kill with standby → voice gap < 2 s (star-only path)
+- [x] 20 % random loss → no silent frames
+- [x] Critical duplication, degrade-only VOICE duplication, slope detection, HELLO interval, TALK_ACK, succession unit tests
+
+**Core tests: 104/104 passing.**
+
+### Done criterion
+- [ ] Kill the hub phone mid-talk with 3+ phones on Wi-Fi Direct: no audible gap — **device test by you**
+

@@ -62,7 +62,8 @@ class StarSimTest {
         assertIs<StarRole.Hub>(roles.getValue(hub), "hub role: $roles")
         val epoch = (roles.getValue(hub) as StarRole.Hub).epoch
         members.filter { it != hub }.forEach {
-            assertEquals(StarRole.Leaf(hub, epoch), roles.getValue(it), "node $it: $roles")
+            val r = assertIs<StarRole.Leaf>(roles.getValue(it), "node $it: $roles")
+            assertEquals(hub to epoch, r.hubId to r.epoch, "node $it: $roles")
         }
         assertEquals(members.size - 1, sim.transport(hub, TransportType.WD).links().size, "every leaf has a WD link to the hub")
     }

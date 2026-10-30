@@ -8,8 +8,13 @@ import com.chalkie.app.routing.Role
 import com.chalkie.app.transport.TransportType
 
 /**
- * Hub election (SPEC §8). Every node runs the same function on nearly the same table,
+ * Hub election (SPEC §8, §19.1). Every node runs the same function on nearly the same table,
  * so they agree without voting; claims with epochs settle the rest.
+ *
+ * Besides the hub, every node picks a **standby** (the best candidate after the hub). When the
+ * hub is lost, everyone switches to the standby at once, with the epoch they all derive
+ * (`max(seen, hubEpoch) + 1`): the standby claims and advertises immediately, the leaves go
+ * straight to it. Leaves hold that switch provisionally until the standby confirms.
  *
  * Pure logic: the node calls [computeMyScore] when it builds a HELLO, feeds in HELLOs and
  * HUB_CLAIMs, and calls [tick] every ELECTION_TICK_MS. [role] is the result.
@@ -26,6 +31,10 @@ class ElectionManager(
     var maxEpochSeen = 0
         private set
 
+    /** Next hub if the current one is lost (may be me). Null when there is no other candidate. */
+    var standbyId: UInt? = null
+        private set
+
     /** The score my last HELLO carried; used for myself so every node compares the same numbers. */
     var publishedScore = 0f
         private set
@@ -37,17 +46,32 @@ class ElectionManager(
     /** False when this phone has no Wi-Fi Direct (e.g. no Play Services): never a hub candidate. */
     @Volatile var canBeHub = true
 
+    /** True while any talk is active: HELLOs are sparser, so HELLO-silence loss waits longer. */
+    @Volatile var talkActive = false
+
     private var challenger: UInt? = null
     private var challengerSinceMs = 0L
+
+    /** The hub I had a WD link to; losing every link to it means it is gone (fast loss). */
+    private var hubLinkedOverWd: UInt? = null
+
+    /** A hub I declared lost; not a candidate again until it is heard from anew. */
+    private var lostHubId: UInt? = null
+
+    /** Set while I switched to the standby but it has not confirmed yet. */
+    private class Pending(val lost: HubState, val sinceMs: Long)
+    private var pending: Pending? = null
 
     val role: StarRole
         @Synchronized get() = current.let {
             when {
                 it == null -> StarRole.Off
-                it.hubId == myId -> StarRole.Hub(it.epoch)
-                else -> StarRole.Leaf(it.hubId, it.epoch)
+                it.hubId == myId -> StarRole.Hub(it.epoch, standbyId)
+                else -> StarRole.Leaf(it.hubId, it.epoch, standbyId)
             }
         }
+
+    private val lossMs: Long get() = if (talkActive) ChalkieConfig.HUB_LOSS_TALK_MS else ChalkieConfig.HUB_LOSS_MS
 
     @Synchronized
     fun computeMyScore(battery: Int, charging: Boolean): Float {
@@ -64,6 +88,7 @@ class ElectionManager(
     @Synchronized
     fun onClaim(srcId: UInt, epoch: Int, score: Float) {
         maxEpochSeen = maxOf(maxEpochSeen, epoch)
+        if (srcId == lostHubId) lostHubId = null
         consider(HubState(srcId, epoch, score))
     }
 
@@ -71,10 +96,23 @@ class ElectionManager(
     fun onHello(srcId: UInt, hello: HelloPayload) {
         maxEpochSeen = maxOf(maxEpochSeen, hello.hubEpoch)
         val claimsHub = Role.HUB in hello.roles && hello.hubId == srcId
+        val p = pending
+        if (p != null && srcId == p.lost.hubId) {
+            // The hub I gave up on is alive and still hub at that epoch: go back to it.
+            if (claimsHub && hello.hubEpoch == p.lost.epoch && current?.let { it.epoch <= p.lost.epoch + 1 } == true) {
+                current = p.lost
+                pending = null
+                lostHubId = null
+                return
+            }
+        }
+        if (srcId == lostHubId) lostHubId = null
         val cur = current
         if (cur != null && cur.hubId == srcId) {
             when {
                 claimsHub && hello.hubEpoch == cur.epoch -> current = cur.copy(score = hello.hubScore)
+                // The standby hasn't noticed the loss yet; wait for it (or the pending timeout).
+                !claimsHub && pending != null -> Unit
                 !claimsHub -> current = null      // it stepped down
             }
         }
@@ -85,40 +123,58 @@ class ElectionManager(
     @Synchronized
     fun tick(): Pair<Int, Float>? {
         val now = clock.nowMs()
-        val fresh = neighbors.all().filter { it.heardHello && now - it.lastHelloMs < ChalkieConfig.HUB_LOSS_MS }
+        val loss = lossMs
+        val fresh = neighbors.all().filter { it.heardHello && now - it.lastHelloMs < loss }
         val offLan = fresh.filter { !it.onLan }
 
         // A hub is needed only when at least 2 nodes (me + one) are off a usable LAN.
         if (onLan || offLan.isEmpty()) {
             current = null
+            standbyId = null
+            pending = null
             challenger = null
             return null
         }
 
-        current?.let { cur ->
-            if (cur.hubId == myId) {
-                if (!eligibleSelf) current = null
-            } else {
-                val h = neighbors.get(cur.hubId)
-                val lost = h == null || now - h.lastHelloMs > ChalkieConfig.HUB_LOSS_MS
-                val ineligible = h != null && h.heardHello && !ScoreCalculator.eligible(h.battery, h.charging)
-                if (lost || ineligible) current = null
-            }
-        }
-
         val candidates = buildList {
-            offLan.filter { ScoreCalculator.eligible(it.battery, it.charging) && it.hubScore > 0f }
+            offLan.filter { it.nodeId != lostHubId && ScoreCalculator.eligible(it.battery, it.charging) && it.hubScore > 0f }
                 .forEach { add(it.nodeId to it.hubScore) }
             if (eligibleSelf && publishedScore > 0f) add(myId to publishedScore)
         }
-        val winner = candidates.maxWithOrNull(WINNER_ORDER) ?: return null
 
+        pending?.let { if (now - it.sinceMs > ChalkieConfig.STANDBY_CONFIRM_MS) { current = null; pending = null } }
+
+        current?.let { cur ->
+            if (cur.hubId == myId) {
+                if (!eligibleSelf) current = null
+            } else if (pending == null) {
+                val h = neighbors.get(cur.hubId)
+                val wdNow = h?.links?.containsKey(TransportType.WD) == true
+                // Fast loss: I had a WD link to the hub and now have no link to it at all.
+                val linkLost = hubLinkedOverWd == cur.hubId && h?.isDirect != true
+                val silent = h == null || now - h.lastHelloMs > loss
+                val ineligible = h != null && h.heardHello && !ScoreCalculator.eligible(h.battery, h.charging)
+                hubLinkedOverWd = cur.hubId.takeIf { wdNow } ?: hubLinkedOverWd?.takeIf { it == cur.hubId && h?.isDirect == true }
+                if (linkLost || silent || ineligible) {
+                    lostHubId = cur.hubId
+                    hubLinkedOverWd = null
+                    return succeed(cur, candidates, now)
+                }
+            }
+        }
+
+        val winner = candidates.maxWithOrNull(WINNER_ORDER)
         val cur = current
         if (cur == null) {
+            standbyId = null
             challenger = null
+            if (winner == null) return null
             val settled = now - startedMs >= ChalkieConfig.HUB_SETTLE_MS
             return if (winner.first == myId && settled) claim() else null
         }
+
+        standbyId = candidates.filter { it.first != cur.hubId }.maxWithOrNull(WINNER_ORDER)?.first
+        if (pending != null || winner == null) return null
 
         // Hysteresis: switch only for a clearly better candidate, held continuously.
         val curScore = if (cur.hubId == myId) publishedScore else neighbors.get(cur.hubId)?.hubScore ?: cur.score
@@ -136,10 +192,34 @@ class ElectionManager(
         return null
     }
 
+    /**
+     * The hub [lost] is gone. Everyone moves to the standby at the epoch they all derive; the
+     * standby claims now. Without a usable standby, fall back to a fresh election.
+     */
+    private fun succeed(lost: HubState, candidates: List<Pair<UInt, Float>>, now: Long): Pair<Int, Float>? {
+        val sb = standbyId?.takeIf { id -> id != lost.hubId && candidates.any { it.first == id } }
+        standbyId = null
+        challenger = null
+        if (sb == null) {
+            current = null
+            return null
+        }
+        val epoch = maxOf(maxEpochSeen, lost.epoch) + 1
+        if (sb == myId) {
+            maxEpochSeen = epoch
+            current = HubState(myId, epoch, publishedScore)
+            return epoch to publishedScore
+        }
+        current = HubState(sb, epoch, candidates.first { it.first == sb }.second)
+        pending = Pending(lost, now)
+        return null
+    }
+
     private fun claim(): Pair<Int, Float> {
         val epoch = maxOf(maxEpochSeen, current?.epoch ?: 0) + 1
         maxEpochSeen = epoch
         current = HubState(myId, epoch, publishedScore)
+        pending = null
         return epoch to publishedScore
     }
 
@@ -147,8 +227,11 @@ class ElectionManager(
         val cur = current
         when {
             cur == null -> if (c.hubId != myId) current = c   // never adopt stale news about myself
-            c.hubId == cur.hubId -> if (c.epoch >= cur.epoch) current = c
-            beats(c, cur) -> current = c                       // if I was hub, I step down here
+            c.hubId == cur.hubId -> if (c.epoch >= cur.epoch) {
+                current = c
+                pending = null                                  // the standby confirmed
+            }
+            beats(c, cur) -> { current = c; pending = null }   // if I was hub, I step down here
         }
     }
 

@@ -25,6 +25,9 @@ class BridgeElection(
     var maxEpochSeen = 0
         private set
     private var candidate = false
+
+    /** True while any talk is active: HELLOs are sparser, so freshness waits longer. */
+    @Volatile var talkActive = false
     private var challengeSinceMs: Long? = null
 
     @Synchronized
@@ -58,7 +61,8 @@ class BridgeElection(
             challengeSinceMs = null
             return null
         }
-        val fresh = neighbors.all().filter { it.heardHello && it.onLan && now - it.lastHelloMs < ChalkieConfig.HUB_LOSS_MS }
+        val lossMs = if (talkActive) ChalkieConfig.HUB_LOSS_TALK_MS else ChalkieConfig.HUB_LOSS_MS
+        val fresh = neighbors.all().filter { it.heardHello && it.onLan && now - it.lastHelloMs < lossMs }
         val others = fresh.filter { Role.BRIDGE in it.roles }.map { it.nodeId to it.bridgeScore }
 
         if (amBridge) {

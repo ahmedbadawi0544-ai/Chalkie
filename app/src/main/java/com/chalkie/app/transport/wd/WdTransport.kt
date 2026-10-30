@@ -73,6 +73,8 @@ class WdTransport(
     }
 
     private val endpoints = ConcurrentHashMap<String, Endpoint>()
+    /** Hub adverts seen while discovering: nodeId -> (endpointId, epoch). Lets a leaf jump to the standby at once. */
+    private val adverts = ConcurrentHashMap<UInt, Pair<String, Int>>()
     private val links = ConcurrentHashMap<UInt, Link>()
 
     /** Live state for the UI. */
@@ -116,12 +118,14 @@ class WdTransport(
         when (r) {
             StarRole.Off -> {
                 stopAdvertising(); stopDiscovery()
+                adverts.clear()
                 client.stopAllEndpoints()
                 dropAll()
                 state = "off"
             }
             is StarRole.Hub -> {
                 stopDiscovery()
+                adverts.clear()
                 // Leaves of an older star (or my old hub) go; a hub keeps nothing but its leaves.
                 if (!advertising) {
                     client.stopAllEndpoints()
@@ -136,7 +140,15 @@ class WdTransport(
                 val keep = links[r.hubId]
                 links.values.filter { it !== keep }.forEach { client.disconnectFromEndpoint(it.endpointId); onGone(it.endpointId) }
                 endpoints.values.filter { it.expectedId != r.hubId }.forEach { client.disconnectFromEndpoint(it.id); onGone(it.id) }
-                if (keep == null) startDiscovery()
+                if (keep == null) {
+                    // Pre-discovered (e.g. the standby that just took over): connect without waiting.
+                    adverts[r.hubId]?.takeIf { it.second == r.epoch }?.let { (endpointId, _) -> requestHub(endpointId, r) }
+                    startDiscovery()
+                } else if (r.standbyId != null && r.standbyId != myId) {
+                    startDiscovery()                       // keep watching for the standby's advert (SPEC §19.1)
+                } else {
+                    stopDiscovery()
+                }
                 state = "leaf"
             }
         }
@@ -195,14 +207,21 @@ class WdTransport(
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             val r = role as? StarRole.Leaf ?: return
             val peer = parseInfo(info.endpointInfo) ?: return
+            adverts[peer.nodeId] = endpointId to peer.epoch
             if (peer.nodeId != r.hubId || peer.epoch != r.epoch) return
-            if (links.containsKey(r.hubId) || endpoints.values.any { it.expectedId == r.hubId }) return
-            Log.i(TAG, "found hub ${Ids.hex(peer.nodeId)}, connecting")
-            client.requestConnection(endpointInfo(r.epoch), endpointId, lifecycle)
-                .addOnFailureListener { Log.w(TAG, "requestConnection failed: ${it.message}") }
+            requestHub(endpointId, r)
         }
 
-        override fun onEndpointLost(endpointId: String) = Unit
+        override fun onEndpointLost(endpointId: String) {
+            adverts.entries.removeIf { it.value.first == endpointId }
+        }
+    }
+
+    private fun requestHub(endpointId: String, r: StarRole.Leaf) {
+        if (links.containsKey(r.hubId) || endpoints.values.any { it.expectedId == r.hubId }) return
+        Log.i(TAG, "found hub ${Ids.hex(r.hubId)}, connecting")
+        client.requestConnection(endpointInfo(r.epoch), endpointId, lifecycle)
+            .addOnFailureListener { Log.w(TAG, "requestConnection failed: ${it.message}") }
     }
 
     private val lifecycle = object : ConnectionLifecycleCallback() {
@@ -273,7 +292,8 @@ class WdTransport(
                 ep.peerId = step.peerId
                 val link = Link(step.peerId, ep.id)
                 links[step.peerId] = link
-                if (role is StarRole.Leaf) stopDiscovery()   // Nearby works best without discovery running
+                // Nearby works best without discovery running; keep it only to watch for a standby.
+                (role as? StarRole.Leaf)?.let { if (it.standbyId == null || it.standbyId == myId) stopDiscovery() }
                 _events.tryEmit(TransportEvent.LinkUp(link.info()))
                 Log.i(TAG, "link up ${Ids.hex(step.peerId)} as ${role::class.simpleName}")
             }
@@ -332,7 +352,7 @@ class WdTransport(
         private val inFlight = HashSet<Long>()
         @Volatile var lastRxMs = clock.nowMs()
 
-        fun info() = LinkInfo(peerId, TransportType.WD, null, 0f, null, lastRxMs)
+        fun info() = LinkInfo(peerId, TransportType.WD, null, queue.lossRate(clock.nowMs()), null, lastRxMs)
 
         fun enqueue(bytes: ByteArray, priority: Priority): Boolean {
             if (!queue.offer(bytes, priority, clock.nowMs())) return false

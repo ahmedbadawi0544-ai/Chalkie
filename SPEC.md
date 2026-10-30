@@ -144,6 +144,7 @@ Binary, big-endian. All transports carry the same packet bytes.
 | 0x10 | TALK_START | 5 | CONTROL |
 | 0x11 | VOICE | 3 | VOICE |
 | 0x12 | TALK_END | 5 | CONTROL |
+| 0x13 | TALK_ACK | 5 | CONTROL |
 | 0x20 | TEXT | 5 | NORMAL |
 | 0x30 | SOS | 7 | SOS |
 | 0x31 | SOS_ACK | 7 | SOS |
@@ -225,7 +226,7 @@ A neighbor's **best link** = the minimum-cost link that is UP.
 
 ## 7. HELLO
 
-- Sent every `HELLO_INTERVAL_MS` (2000 ms ± 300 ms jitter).
+- Sent every `HELLO_INTERVAL_MS` (2000 ms ± 300 ms jitter); every `HELLO_INTERVAL_TALK_MS` (5000 ms) while a talk is active (§19.5).
 - Goes over **every** transport the node has: BLE always, LAN if active, WD if connected. Relayed with TTL 3.
 
 ### Payload
@@ -285,6 +286,8 @@ The current hub stays unless:
 - Leaves connect **only** to the hub whose `(hubId, epoch)` is current.
 
 ### Failover timeline
+(Without a standby. With one, see §19.1: the standby takes over in under 2 s.)
+
 | Time | Event |
 |---|---|
 | t=0 | Hub disappears |
@@ -461,7 +464,8 @@ any network change (roam, IP change)     → PROBING
 
 ### Playback
 - A JitterBuffer per `(srcId, streamId)`: target 80 ms, max 300 ms.
-- Late frames are dropped. A missing frame → repeat the last frame once, then silence.
+- Late frames are dropped. Missing frames → repeat the last frame for up to one packet (`JITTER_CONCEAL_FRAMES` = 2 frames), then silence.
+- Redundant frames (§19.4) fill a single lost packet before it is due.
 - The Mixer sums active streams of the **selected channel** with clipping (normally 1 stream).
 - `AudioTrack` usage `VOICE_COMMUNICATION`. Route to a BT headset if connected (`setCommunicationDevice`, API 31+).
 
@@ -572,6 +576,8 @@ Shows the TopologyGraph:
 | HELLO_INTERVAL_MS | 2000 (±300 jitter) |
 | NODE_TIMEOUT_MS | 15000 |
 | HUB_LOSS_MS | 6000 |
+| HELLO_INTERVAL_TALK_MS / HUB_LOSS_TALK_MS | 5000 / 12000 (while a talk is active) |
+| STANDBY_CONFIRM_MS | 3000 |
 | HUB_SWITCH_FACTOR | 1.25 |
 | HUB_SWITCH_HOLD_MS | 10000 |
 | MIN_BATTERY_FOR_ROLE | 20 |
@@ -582,11 +588,17 @@ Shows the TopologyGraph:
 | DEDUP_MAX / DEDUP_TTL_MS | 4096 / 30000 |
 | BLE_MAX_LINKS | 4 |
 | BLE_RSSI_GOOD | -70 |
-| BLE_LINK_TIMEOUT_MS | 6000 |
+| BLE_LINK_TIMEOUT_MS / WD_LINK_TIMEOUT_MS | 12000 (two talk-time HELLOs) |
+| BLE_SPARE_LINKS / BLE_PREPARE_HOLD_MS | 1 / 10000 |
+| LINK_HEALTH_EMA_ALPHA | 0.3 |
+| LINK_DEGRADE_SLOPE_DB / LINK_SLOPE_WINDOW_MS | -3 dB / 2000 |
+| LINK_DEGRADE_LOSS | 0.10 |
 | LAN_DATA_PORT / LAN_MCAST | 47000 / 239.255.42.99:47001 |
 | LAN_PROBE_MS / LAN_REPROBE_MS | 5000 / 15000 (isolated: 30000) |
 | VOICE_FRAME_MS / FRAMES_PER_PACKET | 20 / 2 |
 | JITTER_TARGET_MS / JITTER_MAX_MS | 80 / 300 |
+| JITTER_CONCEAL_FRAMES | 2 (one packet) |
+| VOICE_REDUNDANT_PACKETS | 1 (0 = off) |
 | VOICE_MAX_QUEUE_MS | 200 |
 | CHANNEL_BUSY_MS | 500 |
 | FLOOR_COLLISION_MS | 300 |
@@ -622,3 +634,81 @@ Shows the TopologyGraph:
 | BLE throughput varies by phone | Voice ≈ 75 kbps fits; Opus in P5 cuts it to about 20 kbps |
 | OEM background killing (Xiaomi, Samsung) | Foreground service + battery-optimization exemption + onboarding guide |
 | Clock differences between phones | Only per-source ordering is used (frameSeq, msgId); no global clock needed |
+
+---
+
+## 19. Wi-Fi 8–style reliability
+
+Goal: the user never hears the network heal. Every mechanism below is pure `:core` logic, proven
+on the JVM simulator (§15), with thin hooks in the transports.
+
+### 19.1 Primary + standby hub
+- Election picks the **primary hub** (§8) and a **standby**: the best candidate after the hub
+  (same score, same tie-break), recomputed every tick. Every node computes it from the same
+  table, so they agree without extra messages.
+- Roles carry it: `Hub(epoch, standbyId)`, `Leaf(hubId, epoch, standbyId)`.
+- **Leaves pre-discover:** while a standby exists, a leaf keeps Nearby discovery running after
+  it joined the hub and caches every hub advert it sees (`nodeId → endpointId, epoch`), so the
+  standby's advert is found the moment it appears.
+- **Fast loss:** the hub is lost when (a) I had a WD link to it and now have **no link at all**
+  to it, or (b) no HELLO for `HUB_LOSS_MS` (`HUB_LOSS_TALK_MS` while talking), or (c) it became
+  ineligible. (a) reacts to the transport's link-down at once instead of waiting for HELLO silence.
+- **Succession:** on loss every node switches to the standby at epoch `max(seenEpochs, hubEpoch) + 1`.
+  The standby claims (`HUB_CLAIM`) and starts advertising immediately; leaves become
+  `Leaf(standby, epoch+1)` and connect to the cached advert without a discovery phase.
+- A leaf's switch is **provisional** until the standby confirms (its claim or a HUB HELLO). If
+  instead the old hub is heard still claiming its epoch (only my link broke), the leaf goes back.
+  No confirmation within `STANDBY_CONFIRM_MS` → normal election (§8). A hub declared lost is not
+  a candidate again until it is heard from anew.
+- Target: voice gap < 2 s from link loss even when the star is the only path (sim: ~0.7 s).
+- Detection is bounded by how fast the transport reports the link down: Nearby's
+  `onDisconnected`, else `WD_LINK_TIMEOUT_MS`.
+
+### 19.2 Make-before-break
+- `LinkHealth` tracks every link: RSSI EMA, **RSSI slope** EMA (dB per 2 s), and the
+  transport's rolling loss rate. Transports report loss as packets refused or dropped stale by
+  the link's send queue per `LINK_STATS_WINDOW_MS`.
+- A link is **degrading** when slope < `-3 dB / 2 s` or loss > `10 %`.
+- While degrading:
+  - It no longer "covers" its neighbor (§10): the next transport carries a copy (see 19.3).
+  - Unicast next hop prefers any healthy link to that neighbor over the degrading one, even if it costs more.
+  - The node asks every other transport that has no link to that neighbor to **bring one up**
+    (`LinkPreparer.prepareLink`). BLE puts it first in its connect order for
+    `BLE_PREPARE_HOLD_MS` and allows `BLE_SPARE_LINKS` extra link, trimmed back to
+    `BLE_MAX_LINKS` (weakest non-preferred) once it is no longer needed.
+
+### 19.3 Duplicate paths for what matters
+- **Critical packets** — `SOS`, `SOS_ACK`, `TALK_START`, `TALK_END`, `TALK_ACK` — always go out
+  on 2 transports when available: BLE ignores the covered-set for them, and a unicast also
+  goes to the same next hop over a second transport. Dedup by `(srcId, msgId)` keeps one.
+- **VOICE** is duplicated on a second transport **only while the primary link is degrading**
+  (the covered-set skips degrading links). A leaf whose WD link to the hub degrades sends to the
+  hub and over BLE; a hub stops counting a degrading leaf as covered.
+- `TALK_ACK(streamId)`: the callee of a private call answers its `TALK_START`, so the caller
+  knows the call got through.
+
+### 19.4 VOICE redundancy (RFC 2198 style)
+- Each VOICE packet also carries the previous packet's frames:
+  `streamId(2) ‖ frameSeq(2) ‖ codec|0x80(1) ‖ frameCount(1) ‖ frames… ‖ redCount(1) ‖ redFrames…`.
+  Bit 7 of the codec byte marks the redundant block; redundant frames have seq
+  `frameSeq - redCount …`, and use the same per-codec framing.
+- The receiver pushes redundant frames into the jitter buffer first; duplicates and late frames
+  are ignored, so a single lost packet is filled before it is due.
+- Cost: about 2× voice payload (G.711 ≈ 140 kbps on air; Opus ≈ 35 kbps). Phones on builds
+  before §19 cannot decode redundant packets (unknown codec byte), so the whole team updates together.
+
+### 19.5 Talk mode
+While any talk is active (I talk, or a stream was heard in the last `CHANNEL_BUSY_MS`):
+- HELLO every `HELLO_INTERVAL_TALK_MS` (5 s) instead of 2 s; hub/bridge freshness windows use
+  `HUB_LOSS_TALK_MS`; link keepalive timeouts are sized for it.
+- BLE scanning switches to `SCAN_MODE_LOW_POWER` (`TalkAware`), back to low latency after the talk.
+
+### 19.6 Tests (JVM)
+- Hub kill with a standby, BLE out of range (star is the only path): voice gap < 2 s at every
+  listener, standby advertising < 1 s after the loss, one star again afterwards.
+- 20 % random loss on every link (LAN + BLE): zero silent frames over 500 packets (checked over
+  several simulator seeds), while packets are really lost on both paths.
+- Critical packets on 2 transports, VOICE on 1 in a healthy star; VOICE duplicated on BLE only
+  while the WD link degrades; unicast moves off a degrading link; RSSI slope detection;
+  HELLO every 5 s during a talk; private call `TALK_ACK`; payload round-trips; succession,
+  revert and confirm in the election.

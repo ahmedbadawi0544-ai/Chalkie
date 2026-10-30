@@ -28,7 +28,8 @@ data class LinkParams(val loss: Double = 0.0, val latencyMs: Long = 10, val rssi
  * [connect]/[disconnect]/[kill] change the topology while a test runs.
  *
  * Wi-Fi Direct is driven by the nodes' STAR roles, like Nearby: a leaf connects to its
- * hub WD_CONNECT_MS after both roles match, if the two are in Wi-Fi range.
+ * hub WD_CONNECT_MS after both roles match, if the two are in Wi-Fi range. A leaf that was
+ * pre-discovering that node as its standby connects in WD_RECONNECT_MS instead.
  */
 class SimNetwork(
     private val scope: CoroutineScope,
@@ -44,6 +45,8 @@ class SimNetwork(
 
     private val wdRoles = HashMap<UInt, StarRole>()
     private val wdPending = HashSet<Pair<UInt, UInt>>()
+    /** leaf → the standby it was pre-discovering. */
+    private val prediscovered = HashMap<UInt, UInt>()
     private val dead = HashSet<UInt>()
 
     /** Pairs that cannot reach each other over Wi-Fi Direct (default: everyone can). */
@@ -82,6 +85,15 @@ class SimNetwork(
         transport(b, type).linkUp(a, params)
     }
 
+    /** Changes a live link's quality; both ends report it as LinkStats (like a real transport). */
+    fun updateLink(a: UInt, b: UInt, type: TransportType, params: LinkParams) {
+        val e = edge(a, b, type)
+        if (e !in edges) return
+        edges[e] = params
+        transport(a, type).linkStats(b, params)
+        transport(b, type).linkStats(a, params)
+    }
+
     fun disconnect(a: UInt, b: UInt, type: TransportType = TransportType.BLE) {
         if (edges.remove(edge(a, b, type)) == null) return
         transports[a to type]?.linkDown(b)
@@ -101,6 +113,7 @@ class SimNetwork(
     // ---- Wi-Fi Direct (Nearby-like) ----
 
     internal fun onWdRole(id: UInt, role: StarRole) {
+        (wdRoles[id] as? StarRole.Leaf)?.standbyId?.let { prediscovered[id] = it }
         wdRoles[id] = role
         reconcileWd()
     }
@@ -116,8 +129,9 @@ class SimNetwork(
             val pair = leaf to role.hubId
             if (!starMatches(leaf, role.hubId) || edges.containsKey(edge(leaf, role.hubId, TransportType.WD)) || pair in wdPending) continue
             wdPending += pair
+            val wait = if (prediscovered[leaf] == role.hubId) WD_RECONNECT_MS else WD_CONNECT_MS
             scope.launch {
-                delay(WD_CONNECT_MS)
+                delay(wait)
                 wdPending -= pair
                 if (starMatches(leaf, role.hubId) && !edges.containsKey(edge(leaf, role.hubId, TransportType.WD))) {
                     connect(leaf, role.hubId, TransportType.WD, LinkParams(latencyMs = 5, rssi = null))
@@ -151,6 +165,8 @@ class SimNetwork(
     companion object {
         /** Nearby discovery + connection setup time. */
         const val WD_CONNECT_MS = 1500L
+        /** Connection to an advert found while pre-discovering (no discovery phase left). */
+        const val WD_RECONNECT_MS = 500L
     }
 }
 
@@ -187,6 +203,13 @@ open class FakeTransport(
         val info = LinkInfo(peer, type, if (type == TransportType.BLE) p.rssi else null, p.loss.toFloat(), null, net.clock.nowMs())
         links[peer] = info
         emit(TransportEvent.LinkUp(info))
+    }
+
+    internal fun linkStats(peer: UInt, p: LinkParams) {
+        val info = LinkInfo(peer, type, if (type == TransportType.BLE) p.rssi else null, p.loss.toFloat(), null, net.clock.nowMs())
+        if (peer !in links) return
+        links[peer] = info
+        emit(TransportEvent.LinkStats(info))
     }
 
     internal fun linkDown(peer: UInt) {

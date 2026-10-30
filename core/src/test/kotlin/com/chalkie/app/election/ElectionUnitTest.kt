@@ -53,7 +53,7 @@ class ElectionUnitTest {
     fun hysteresisIgnoresNoisyChallenger() {
         val rig = Rig { now }
         rig.hubHello()
-        assertEquals(StarRole.Leaf(1u, 1), rig.em.role)
+        assertEquals(StarRole.Leaf(1u, 1), rig.em.role.core())
         // My score: 0.4·B + 0.3·0.6 + 0.3·1. Battery 100 → 0.88 (> 0.5·1.25); battery 10 → ineligible.
         var claims = 0
         while (now < 60_000) {
@@ -64,7 +64,7 @@ class ElectionUnitTest {
             now += 250
         }
         assertEquals(0, claims, "never 10 s continuously better → no switch")
-        assertEquals(StarRole.Leaf(1u, 1), rig.em.role)
+        assertEquals(StarRole.Leaf(1u, 1), rig.em.role.core())
     }
 
     @Test
@@ -80,7 +80,7 @@ class ElectionUnitTest {
         }
         val at = assertNotNull(claimAt)
         assertTrue(at in 10_000..10_500, "claimed at $at ms")
-        assertEquals(StarRole.Hub(2), rig.em.role)
+        assertEquals(StarRole.Hub(2), rig.em.role.core())
     }
 
     @Test
@@ -121,8 +121,15 @@ class ElectionUnitTest {
         em.computeMyScore(100, true)
         now = 5000
         assertNotNull(em.tick())
-        assertEquals(StarRole.Hub(1), em.role)
+        assertEquals(StarRole.Hub(1), em.role.core())
         em.onClaim(2u, 2, 0.1f)
-        assertEquals(StarRole.Leaf(2u, 2), em.role)
+        assertEquals(StarRole.Leaf(2u, 2), em.role.core())
+    }
+
+    /** Role without the standby, for comparing hub/epoch only. */
+    private fun StarRole.core(): StarRole = when (this) {
+        is StarRole.Hub -> copy(standbyId = null)
+        is StarRole.Leaf -> copy(standbyId = null)
+        StarRole.Off -> this
     }
 }

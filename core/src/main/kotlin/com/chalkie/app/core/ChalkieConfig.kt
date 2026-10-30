@@ -4,6 +4,8 @@ package com.chalkie.app.core
 object ChalkieConfig {
     // HELLO / neighbor liveness
     const val HELLO_INTERVAL_MS = 2000L
+    /** While any talk is active: fewer HELLOs, more air for voice (SPEC §19.5). */
+    const val HELLO_INTERVAL_TALK_MS = 5000L
     const val HELLO_JITTER_MS = 300L
     const val NODE_TIMEOUT_MS = 15_000L
     const val HELLO_MAX_NAME_BYTES = 24
@@ -13,6 +15,10 @@ object ChalkieConfig {
 
     // Election (P2/P3)
     const val HUB_LOSS_MS = 6000L
+    /** HELLO-silence hub loss while a talk is active (HELLOs are 5 s apart then). */
+    const val HUB_LOSS_TALK_MS = 2 * HELLO_INTERVAL_TALK_MS + 2 * HELLO_JITTER_MS + 1400
+    /** A provisional switch to the standby hub is dropped if the standby doesn't confirm in this time. */
+    const val STANDBY_CONFIRM_MS = 3000L
     const val HUB_SWITCH_FACTOR = 1.25
     const val HUB_SWITCH_HOLD_MS = 10_000L
     const val MIN_BATTERY_FOR_ROLE = 20
@@ -31,7 +37,8 @@ object ChalkieConfig {
     // Wi-Fi Direct STAR (Nearby Connections)
     const val WD_SERVICE_ID = "com.chalkie.app.wd"
     const val WD_MAX_IN_FLIGHT = 2
-    const val WD_LINK_TIMEOUT_MS = 6000L
+    /** HELLO is the keepalive; two talk-time HELLO intervals must fit. */
+    const val WD_LINK_TIMEOUT_MS = HUB_LOSS_TALK_MS
     const val WD_CONNECT_RETRY_MS = 3000L
     const val WD_BLE_SCAN_PAUSE_MS = 3000L
 
@@ -65,10 +72,21 @@ object ChalkieConfig {
     const val LOSS_DOWN_THRESHOLD = 0.30f
     const val LINK_STATS_WINDOW_MS = 10_000L
 
+    // Link health, make-before-break (SPEC §19.2)
+    const val LINK_HEALTH_EMA_ALPHA = 0.3
+    /** RSSI slope is expressed in dB per this many ms. */
+    const val LINK_SLOPE_WINDOW_MS = 2000L
+    const val LINK_DEGRADE_SLOPE_DB = -3.0
+    const val LINK_DEGRADE_LOSS = 0.10
+
     // BLE
     const val BLE_MAX_LINKS = 4
     const val BLE_RSSI_GOOD = -70
-    const val BLE_LINK_TIMEOUT_MS = 6000L
+    const val BLE_LINK_TIMEOUT_MS = HUB_LOSS_TALK_MS
+    /** Extra BLE link allowed while making a backup link before a degrading one breaks. */
+    const val BLE_SPARE_LINKS = 1
+    /** How long a make-before-break request keeps a neighbor at the front of the BLE queue. */
+    const val BLE_PREPARE_HOLD_MS = 10_000L
     const val BLE_RSSI_EMA_ALPHA = 0.3
     const val BLE_SWAP_RSSI_MARGIN_DB = 10
     const val BLE_SWAP_HOLD_MS = 5000L
@@ -97,8 +115,12 @@ object ChalkieConfig {
     const val FRAMES_PER_PACKET = 2
     const val JITTER_TARGET_MS = 80
     const val JITTER_MAX_MS = 300
+    /** Missing frames concealed by repeating the last one: one whole lost packet (SPEC §19.4). */
+    const val JITTER_CONCEAL_FRAMES = FRAMES_PER_PACKET
     const val JITTER_STREAM_IDLE_MS = 1000L
     const val VOICE_MAX_QUEUE_MS = 200L
+    /** RFC 2198-style redundancy: each VOICE packet repeats the previous packet's frames. */
+    const val VOICE_REDUNDANT_PACKETS = 1
 
     // Floor control
     const val CHANNEL_BUSY_MS = 500L

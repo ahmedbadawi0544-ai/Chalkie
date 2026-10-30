@@ -15,44 +15,76 @@ enum class Codec(val id: Int, val frameBytes: Int?) {
 }
 
 /**
- * `streamId(2) ‖ frameSeq(2) ‖ codec(1) ‖ frameCount(1) ‖ frames…` (SPEC §12).
+ * `streamId(2) ‖ frameSeq(2) ‖ codec(1) ‖ frameCount(1) ‖ frames… [‖ redCount(1) ‖ redFrames…]` (SPEC §12, §19.4).
  * Fixed-size codecs pack frames back to back; variable-size codecs prefix each with len(1).
+ *
+ * RFC 2198-style redundancy: when bit 7 of the codec byte is set, the packet also carries
+ * [redundant] = the frames just before [frameSeq] (seq `frameSeq - redCount` …), so a receiver
+ * can fill one lost packet from the next.
  */
-class VoicePayload(val streamId: Int, val frameSeq: Int, val codec: Codec, val frames: List<ByteArray>) {
+class VoicePayload(
+    val streamId: Int,
+    val frameSeq: Int,
+    val codec: Codec,
+    val frames: List<ByteArray>,
+    val redundant: List<ByteArray> = emptyList(),
+) {
+    /** Sequence number of the first redundant frame. */
+    val redundantSeq: Int get() = (frameSeq - redundant.size) and 0xFFFF
+
     fun encode(): ByteArray {
         val fixed = codec.frameBytes
-        val buf = ByteBuffer.allocate(6 + frames.sumOf { it.size } + if (fixed == null) frames.size else 0)
+        val red = redundant.isNotEmpty()
+        fun size(list: List<ByteArray>) = list.sumOf { it.size } + if (fixed == null) list.size else 0
+        val buf = ByteBuffer.allocate(6 + size(frames) + if (red) 1 + size(redundant) else 0)
         buf.putShort(streamId.toShort()).putShort(frameSeq.toShort())
-        buf.put(codec.id.toByte()).put(frames.size.toByte())
-        frames.forEach {
-            if (fixed != null) require(it.size == fixed) else { require(it.size in 1..255); buf.put(it.size.toByte()) }
-            buf.put(it)
+        buf.put((codec.id or if (red) RED_FLAG else 0).toByte()).put(frames.size.toByte())
+        fun put(f: ByteArray) {
+            if (fixed != null) require(f.size == fixed) else { require(f.size in 1..255); buf.put(f.size.toByte()) }
+            buf.put(f)
+        }
+        frames.forEach(::put)
+        if (red) {
+            buf.put(redundant.size.toByte())
+            redundant.forEach(::put)
         }
         return buf.array()
     }
 
     companion object {
+        private const val RED_FLAG = 0x80
+
         fun decode(bytes: ByteArray): VoicePayload? {
             if (bytes.size < 6) return null
             val buf = ByteBuffer.wrap(bytes)
             val streamId = buf.short.toInt() and 0xFFFF
             val seq = buf.short.toInt() and 0xFFFF
-            val codec = Codec.fromId(buf.get().toInt() and 0xFF) ?: return null
+            val codecByte = buf.get().toInt() and 0xFF
+            val codec = Codec.fromId(codecByte and RED_FLAG.inv()) ?: return null
             val count = buf.get().toInt() and 0xFF
-            val fixed = codec.frameBytes
-            if (fixed != null) {
-                if (bytes.size != 6 + count * fixed) return null
-                return VoicePayload(streamId, seq, codec, List(count) { ByteArray(fixed).also { f -> buf.get(f) } })
+            val frames = readFrames(buf, codec, count) ?: return null
+            val redundant = if (codecByte and RED_FLAG != 0) {
+                if (!buf.hasRemaining()) return null
+                readFrames(buf, codec, buf.get().toInt() and 0xFF) ?: return null
+            } else {
+                emptyList()
             }
+            if (buf.hasRemaining()) return null
+            return VoicePayload(streamId, seq, codec, frames, redundant)
+        }
+
+        private fun readFrames(buf: ByteBuffer, codec: Codec, count: Int): List<ByteArray>? {
+            val fixed = codec.frameBytes
             val frames = ArrayList<ByteArray>(count)
             repeat(count) {
-                if (!buf.hasRemaining()) return null
-                val len = buf.get().toInt() and 0xFF
+                val len = if (fixed != null) fixed else {
+                    if (!buf.hasRemaining()) return null
+                    buf.get().toInt() and 0xFF
+                }
                 if (len == 0 || buf.remaining() < len) return null
                 frames += ByteArray(len).also { f -> buf.get(f) }
             }
-            if (buf.hasRemaining()) return null
-            return VoicePayload(streamId, seq, codec, frames)
+            return frames
         }
     }
 }
