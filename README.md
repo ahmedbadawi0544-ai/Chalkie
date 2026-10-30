@@ -110,4 +110,4 @@ The architecture, protocol and design decisions are in [`docs/ARCHITECTURE.md`](
 
 ## License
 
-No license has been chosen yet; all rights reserved by the author.
+[MIT](LICENSE) © 2026 ahmedbadawi0544-ai
